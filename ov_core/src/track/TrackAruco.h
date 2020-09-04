@@ -45,7 +45,7 @@ namespace ov_core {
         TrackAruco() : TrackBase(), max_tag_id(1024), do_downsizing(false) {
             aruco_dict = cv::aruco::getPredefinedDictionary(cv::aruco::DICT_6X6_250);
             aruco_params = cv::aruco::DetectorParameters::create();
-            aruco_params->cornerRefinementMethod = cv::aruco::CornerRefineMethod::CORNER_REFINE_SUBPIX; // people with newer opencv might fail here
+            //aruco_params->cornerRefinementMethod = cv::aruco::CornerRefineMethod::CORNER_REFINE_SUBPIX; // people with newer opencv might fail here
         }
 
         /**
@@ -56,7 +56,7 @@ namespace ov_core {
         explicit TrackAruco(int numaruco, bool do_downsizing) : TrackBase(0, numaruco), max_tag_id(numaruco), do_downsizing(do_downsizing) {
             aruco_dict = cv::aruco::getPredefinedDictionary(cv::aruco::DICT_6X6_250);
             aruco_params = cv::aruco::DetectorParameters::create();
-            aruco_params->cornerRefinementMethod = cv::aruco::CornerRefineMethod::CORNER_REFINE_SUBPIX; // people with newer opencv might fail here
+            //aruco_params->cornerRefinementMethod = cv::aruco::CornerRefineMethod::CORNER_REFINE_SUBPIX; // people with newer opencv might fail here
         }
 
         /**
@@ -103,6 +103,9 @@ namespace ov_core {
 
         // Parameters the opencv extractor uses
         cv::Ptr<cv::aruco::DetectorParameters> aruco_params;
+
+        // Mutex for our ids_aruco, corners, rejects which we use for drawing
+        std::mutex mtx_aruco;
 
         // Our tag IDs and corner we will get from the extractor
         std::unordered_map<size_t, std::vector<int>> ids_aruco;

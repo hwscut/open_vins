@@ -24,7 +24,7 @@
 
 #include "state/StateHelper.h"
 #include "utils/quat_ops.h"
-#include <ros/ros.h>
+
 
 using namespace ov_core;
 
@@ -65,29 +65,37 @@ namespace ov_msckf {
          */
         struct NoiseManager {
 
-            /// Gyro white noise
-            double sigma_w;
+            /// Gyroscope white noise (rad/s/sqrt(hz))
+            double sigma_w = 1.6968e-04;
 
-            /// Gyro white noise covariance
-            double sigma_w_2;
+            /// Gyroscope white noise covariance
+            double sigma_w_2 = pow(1.6968e-04, 2);
 
-            /// Gyro random walk
-            double sigma_wb;
+            /// Gyroscope random walk (rad/s^2/sqrt(hz))
+            double sigma_wb = 1.9393e-05;
 
-            /// Gyro random walk covariance
-            double sigma_wb_2;
+            /// Gyroscope random walk covariance
+            double sigma_wb_2 = pow(1.9393e-05, 2);
 
-            /// Accel white noise
-            double sigma_a;
+            /// Accelerometer white noise (m/s^2/sqrt(hz))
+            double sigma_a = 2.0000e-3;
 
-            /// Accel white noise covariance
-            double sigma_a_2;
+            /// Accelerometer white noise covariance
+            double sigma_a_2 = pow(2.0000e-3, 2);
 
-            /// Accel random walk
-            double sigma_ab;
+            /// Accelerometer random walk (m/s^3/sqrt(hz))
+            double sigma_ab = 3.0000e-03;
 
-            /// Accel random walk covariance
-            double sigma_ab_2;
+            /// Accelerometer random walk covariance
+            double sigma_ab_2 = pow(3.0000e-03, 2);
+
+            /// Nice print function of what parameters we have loaded
+            void print() {
+                printf("\t- gyroscope_noise_density: %.6f\n", sigma_w);
+                printf("\t- accelerometer_noise_density: %.5f\n", sigma_a);
+                printf("\t- gyroscope_random_walk: %.7f\n", sigma_wb);
+                printf("\t- accelerometer_random_walk: %.6f\n", sigma_ab);
+            }
 
         };
 
@@ -123,6 +131,23 @@ namespace ov_msckf {
             // Append it to our vector
             imu_data.emplace_back(data);
 
+            // Sort our imu data (handles any out of order measurements)
+            //std::sort(imu_data.begin(), imu_data.end(), [](const IMUDATA i, const IMUDATA j) {
+            //    return i.timestamp < j.timestamp;
+            //});
+
+            // Loop through and delete imu messages that are older then 20 seconds
+            // TODO: we should probably have more elegant logic then this
+            // TODO: but this prevents unbounded memory growth and slow prop with high freq imu
+            auto it0 = imu_data.begin();
+            while(it0 != imu_data.end()) {
+                if(timestamp-(*it0).timestamp > 20) {
+                    it0 = imu_data.erase(it0);
+                } else {
+                    it0++;
+                }
+            }
+
         }
 
 
@@ -141,13 +166,63 @@ namespace ov_msckf {
         void propagate_and_clone(State *state, double timestamp);
 
 
+        /**
+         * @brief Gets what the state and its covariance will be at a given timestamp
+         *
+         * This can be used to find what the state will be in the "future" without propagating it.
+         * This will propagate a clone of the current IMU state and its covariance matrix.
+         * This is typically used to provide high frequency pose estimates between updates.
+         *
+         * @param state Pointer to state
+         * @param timestamp Time to propagate to
+         * @param state_plus The propagated state (q_GtoI, p_IinG, v_IinG, w_IinI)
+         */
+        void fast_state_propagate(State *state, double timestamp, Eigen::Matrix<double,13,1> &state_plus);
+
+
+        /**
+         * @brief Helper function that given current imu data, will select imu readings between the two times.
+         *
+         * This will create measurements that we will integrate with, and an extra measurement at the end.
+         * We use the @ref interpolate_data() function to "cut" the imu readings at the begining and end of the integration.
+         * The timestamps passed should already take into account the time offset values.
+         *
+         * @param imu_data IMU data we will select measurements from
+         * @param time0 Start timestamp
+         * @param time1 End timestamp
+         * @return Vector of measurements (if we could compute them)
+         */
+        static std::vector<IMUDATA> select_imu_readings(const std::vector<IMUDATA>& imu_data, double time0, double time1);
+
+        /**
+         * @brief Nice helper function that will linearly interpolate between two imu messages.
+         *
+         * This should be used instead of just "cutting" imu messages that bound the camera times
+         * Give better time offset if we use this function, could try other orders/splines if the imu is slow.
+         *
+         * @param imu_1 imu at begining of interpolation interval
+         * @param imu_2 imu at end of interpolation interval
+         * @param timestamp Timestamp being interpolated to
+         */
+        static IMUDATA interpolate_data(const IMUDATA imu_1, const IMUDATA imu_2, double timestamp) {
+            // time-distance lambda
+            double lambda = (timestamp - imu_1.timestamp) / (imu_2.timestamp - imu_1.timestamp);
+            //cout << "lambda - " << lambda << endl;
+            // interpolate between the two times
+            IMUDATA data;
+            data.timestamp = timestamp;
+            data.am = (1 - lambda) * imu_1.am + lambda * imu_2.am;
+            data.wm = (1 - lambda) * imu_1.wm + lambda * imu_2.wm;
+            return data;
+        }
+
 
     protected:
 
 
         /// Estimate for time offset at last propagation time
-        double last_prop_time_offset = 0;
-
+        double last_prop_time_offset = -INFINITY;
+        bool have_last_prop_time_offset = false;
 
         /**
          * @brief Propagates the state forward using the imu data and computes the noise covariance and state-transition
@@ -167,6 +242,67 @@ namespace ov_msckf {
         void predict_and_compute(State *state, const IMUDATA data_minus, const IMUDATA data_plus,
                                  Eigen::Matrix<double, 15, 15> &F, Eigen::Matrix<double, 15, 15> &Qd);
 
+        /**
+         * @brief Discrete imu mean propagation.
+         *
+         * See @ref propagation for details on these equations.
+         * \f{align*}{
+         * \text{}^{I_{k+1}}_{G}\hat{\bar{q}}
+         * &= \exp\bigg(\frac{1}{2}\boldsymbol{\Omega}\big({\boldsymbol{\omega}}_{m,k}-\hat{\mathbf{b}}_{g,k}\big)\Delta t\bigg)
+         * \text{}^{I_{k}}_{G}\hat{\bar{q}} \\
+         * ^G\hat{\mathbf{v}}_{k+1} &= \text{}^G\hat{\mathbf{v}}_{I_k} - {}^G\mathbf{g}\Delta t
+         * +\text{}^{I_k}_G\hat{\mathbf{R}}^\top(\mathbf{a}_{m,k} - \hat{\mathbf{b}}_{\mathbf{a},k})\Delta t\\
+         * ^G\hat{\mathbf{p}}_{I_{k+1}}
+         * &= \text{}^G\hat{\mathbf{p}}_{I_k} + {}^G\hat{\mathbf{v}}_{I_k} \Delta t
+         * - \frac{1}{2}{}^G\mathbf{g}\Delta t^2
+         * + \frac{1}{2} \text{}^{I_k}_{G}\hat{\mathbf{R}}^\top(\mathbf{a}_{m,k} - \hat{\mathbf{b}}_{\mathbf{a},k})\Delta t^2
+         * \f}
+         *
+         * @param state Pointer to state
+         * @param dt Time we should integrate over
+         * @param w_hat1 Angular velocity with bias removed
+         * @param a_hat1 Linear acceleration with bias removed
+         * @param w_hat2 Next angular velocity with bias removed
+         * @param a_hat2 Next linear acceleration with bias removed
+         * @param new_q The resulting new orientation after integration
+         * @param new_v The resulting new velocity after integration
+         * @param new_p The resulting new position after integration
+         */
+        void predict_mean_discrete(State *state, double dt,
+                                   const Eigen::Vector3d &w_hat1, const Eigen::Vector3d &a_hat1,
+                                   const Eigen::Vector3d &w_hat2, const Eigen::Vector3d &a_hat2,
+                                   Eigen::Vector4d &new_q, Eigen::Vector3d &new_v, Eigen::Vector3d &new_p);
+
+        /**
+         * @brief RK4 imu mean propagation.
+         *
+         * See this wikipedia page on [Runge-Kutta Methods](https://en.wikipedia.org/wiki/Runge%E2%80%93Kutta_methods).
+         * We are doing a RK4 method, [this wolframe page](http://mathworld.wolfram.com/Runge-KuttaMethod.html) has the forth order equation defined below.
+         * We define function \f$ f(t,y) \f$ where y is a function of time t, see @ref imu_kinematic for the definition of the continous-time functions.
+         *
+         * \f{align*}{
+         * {k_1} &= f({t_0}, y_0) \Delta t  \\
+         * {k_2} &= f( {t_0}+{\Delta t \over 2}, y_0 + {1 \over 2}{k_1} ) \Delta t \\
+         * {k_3} &= f( {t_0}+{\Delta t \over 2}, y_0 + {1 \over 2}{k_2} ) \Delta t \\
+         * {k_4} &= f( {t_0} + {\Delta t}, y_0 + {k_3} ) \Delta t \\
+         * y_{0+\Delta t} &= y_0 + \left( {{1 \over 6}{k_1} + {1 \over 3}{k_2} + {1 \over 3}{k_3} + {1 \over 6}{k_4}} \right)
+         * \f}
+         *
+         * @param state Pointer to state
+         * @param dt Time we should integrate over
+         * @param w_hat1 Angular velocity with bias removed
+         * @param a_hat1 Linear acceleration with bias removed
+         * @param w_hat2 Next angular velocity with bias removed
+         * @param a_hat2 Next linear acceleration with bias removed
+         * @param new_q The resulting new orientation after integration
+         * @param new_v The resulting new velocity after integration
+         * @param new_p The resulting new position after integration
+         */
+        void predict_mean_rk4(State *state, double dt,
+                              const Eigen::Vector3d &w_hat1, const Eigen::Vector3d &a_hat1,
+                              const Eigen::Vector3d &w_hat2, const Eigen::Vector3d &a_hat2,
+                              Eigen::Vector4d &new_q, Eigen::Vector3d &new_v, Eigen::Vector3d &new_p);
+
 
         /// Container for the noise values
         NoiseManager _noises;
@@ -176,29 +312,6 @@ namespace ov_msckf {
 
         /// Gravity vector
         Eigen::Matrix<double, 3, 1> _gravity;
-
-
-        /**
-         * @brief Nice helper function that will linearly interpolate between two imu messages.
-         *
-         * This should be used instead of just "cutting" imu messages that bound the camera times
-         * Give better time offset if we use this function, could try other orders/splines if the imu is slow.
-         *
-         * @param imu_1 imu at beggining of interpolation interval
-         * @param imu_2 imu at end of interpolation interval
-         * @param timestamp Timestamp being interpolated to
-         */
-        IMUDATA interpolate_data(const IMUDATA imu_1, const IMUDATA imu_2, double timestamp) {
-            // time-distance lambda
-            double lambda = (timestamp - imu_1.timestamp) / (imu_2.timestamp - imu_1.timestamp);
-            //cout << "lambda - " << lambda << endl;
-            // interpolate between the two times
-            IMUDATA data;
-            data.timestamp = timestamp;
-            data.am = (1 - lambda) * imu_1.am + lambda * imu_2.am;
-            data.wm = (1 - lambda) * imu_1.wm + lambda * imu_2.wm;
-            return data;
-        }
 
 
     };

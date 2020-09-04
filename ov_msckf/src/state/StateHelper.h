@@ -24,9 +24,11 @@
 
 #include "State.h"
 #include "types/Landmark.h"
+#include "utils/colors.h"
 
 #include <boost/math/distributions/chi_squared.hpp>
 
+using namespace ov_core;
 
 namespace ov_msckf {
 
@@ -43,6 +45,37 @@ namespace ov_msckf {
 
     public:
 
+
+        /**
+         * @brief Performs EKF propagation of the state covariance.
+         *
+         * The mean of the state should already have been propagated, thus just moves the covariance forward in time.
+         * The new states that we are propagating the old covariance into, should be **contiguous** in memory.
+         * The user only needs to specify the sub-variables that this block is a function of.
+         * \f[
+         * \tilde{\mathbf{x}}' =
+         * \begin{bmatrix}
+         * \boldsymbol\Phi_1 &
+         * \boldsymbol\Phi_2 &
+         * \boldsymbol\Phi_3
+         * \end{bmatrix}
+         * \begin{bmatrix}
+         * \tilde{\mathbf{x}}_1 \\
+         * \tilde{\mathbf{x}}_2 \\
+         * \tilde{\mathbf{x}}_3
+         * \end{bmatrix}
+         * +
+         * \mathbf{n}
+         * \f]
+         *
+         * @param state Pointer to state
+         * @param order_NEW Contiguous variables that have evolved according to this state transition
+         * @param order_OLD Variable ordering used in the state transition
+         * @param Phi State transition matrix (size order_NEW by size order_OLD)
+         * @param Q Additive state propagation noise matrix (size order_NEW by size order_NEW)
+         */
+        static void EKFPropagation(State *state, const std::vector<Type*> &order_NEW, const std::vector<Type*> &order_OLD,
+                                   const Eigen::MatrixXd &Phi, const Eigen::MatrixXd &Q);
 
         /**
          * @brief Performs EKF update of the state (see @ref linear-meas page)
@@ -67,6 +100,19 @@ namespace ov_msckf {
         * @return marginal covariance of the passed variables
         */
         static Eigen::MatrixXd get_marginal_covariance(State *state, const std::vector<Type *> &small_variables);
+
+
+        /**
+         * @brief This gets the full covariance matrix.
+         *
+         * Should only be used during simulation as operations on this covariance will be slow.
+         * This will return a copy, so this cannot be used to change the covariance by design.
+         * Please use the other interface functions in the StateHelper to progamatically change to covariance.
+         *
+         * @param state Pointer to state
+         * @return covariance of current state
+         */
+        static Eigen::MatrixXd get_full_covariance(State *state);
 
         /**
          * @brief Marginalizes a variable, properly modifying the ordering/covariances in the state
@@ -97,6 +143,7 @@ namespace ov_msckf {
          * Uses Givens to separate into updating and initializing systems (therefore system must be fed as isotropic).
          * If you are not isotropic first whiten your system (TODO: we should add a helper function to do this).
          * If your H_L Jacobian is already directly invertable, the just call the initialize_invertible() instead of this function.
+         * Please refer to @ref update-delay page for detailed derivation.
          *
          * @param state Pointer to state
          * @param new_variable Pointer to variable to be initialized
@@ -113,6 +160,9 @@ namespace ov_msckf {
 
         /**
          * @brief Initializes new variable into covariance (H_L must be invertible)
+         *
+         * Please refer to @ref update-delay page for detailed derivation.
+         * This is just the update assuming that H_L is invertable (and thus square) and isotropic noise.
          *
          * @param state Pointer to state
          * @param new_variable Pointer to variable to be initialized
@@ -133,6 +183,19 @@ namespace ov_msckf {
          * This augmentation clones the IMU pose and adds it to our state's clone map.
          * If we are doing time offset calibration we also make our cloning a function of the time offset.
          * Time offset logic is based on Mingyang Li and Anastasios I. Mourikis paper: http://journals.sagepub.com/doi/pdf/10.1177/0278364913515286
+         * We can write the current clone at the true imu base clock time as the follow:
+         * \f{align*}{
+         * {}^{I_{t+t_d}}_G\bar{q} &= \begin{bmatrix}\frac{1}{2} {}^{I_{t+\hat{t}_d}}\boldsymbol\omega \tilde{t}_d \\ 1\end{bmatrix}\otimes{}^{I_{t+\hat{t}_d}}_G\bar{q} \\
+         * {}^G\mathbf{p}_{I_{t+t_d}} &= {}^G\mathbf{p}_{I_{t+\hat{t}_d}} + {}^G\mathbf{v}_{I_{t+\hat{t}_d}}\tilde{t}_d
+         * \f}
+         * where we say that we have propagated our state up to the current estimated true imaging time for the current image,
+         * \f${}^{I_{t+\hat{t}_d}}\boldsymbol\omega\f$ is the angular velocity at the end of propagation with biases removed.
+         * This is off by some smaller error, so to get to the true imaging time in the imu base clock, we can append some small timeoffset error.
+         * Thus the Jacobian in respect to our time offset during our cloning procedure is the following:
+         * \f{align*}{
+         * \frac{\partial {}^{I_{t+t_d}}_G\tilde{\boldsymbol\theta}}{\partial \tilde{t}_d} &= {}^{I_{t+\hat{t}_d}}\boldsymbol\omega \\
+         * \frac{\partial {}^G\tilde{\mathbf{p}}_{I_{t+t_d}}}{\partial \tilde{t}_d} &= {}^G\mathbf{v}_{I_{t+\hat{t}_d}}
+         * \f}
          *
          * @param state Pointer to state
          * @param last_w The estimated angular velocity at cloning time (used to estimate imu-cam time offset)
@@ -150,12 +213,13 @@ namespace ov_msckf {
          * @param state Pointer to state
          */
         static void marginalize_old_clone(State *state) {
-            if ((int) state->n_clones() > state->options().max_clone_size) {
+            if ((int) state->_clones_IMU.size() > state->_options.max_clone_size) {
                 double marginal_time = state->margtimestep();
-                StateHelper::marginalize(state, state->get_clone(marginal_time));
+                assert(marginal_time != INFINITY);
+                StateHelper::marginalize(state, state->_clones_IMU.at(marginal_time));
                 // Note that the marginalizer should have already deleted the clone
                 // Thus we just need to remove the pointer to it from our state
-                state->erase_clone(marginal_time);
+                state->_clones_IMU.erase(marginal_time);
             }
         }
 
@@ -166,17 +230,16 @@ namespace ov_msckf {
         static void marginalize_slam(State* state) {
             // Remove SLAM features that have their marginalization flag set
             // We also check that we do not remove any aruoctag landmarks
-            auto it0 = state->features_SLAM().begin();
-            while(it0 != state->features_SLAM().end()) {
-                if((*it0).second->should_marg && (int)(*it0).first > state->options().max_aruco_features) {
+            auto it0 = state->_features_SLAM.begin();
+            while(it0 != state->_features_SLAM.end()) {
+                if((*it0).second->should_marg && (int)(*it0).first > state->_options.max_aruco_features) {
                     StateHelper::marginalize(state, (*it0).second);
-                    it0 = state->features_SLAM().erase(it0);
+                    it0 = state->_features_SLAM.erase(it0);
                 } else {
                     it0++;
                 }
             }
         }
-
 
 
     private:
